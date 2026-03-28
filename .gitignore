@@ -10,4 +10,4 @@ wheels/
 .venv
 
 # Secrets
-apitoken_tgbot.jwe
+.env
