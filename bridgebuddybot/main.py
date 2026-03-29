@@ -20,9 +20,9 @@ from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-load_dotenv()  # FIX: was referenced as a value, not called as a function
+load_dotenv()
 
-# ── logging ────────────────────────────────────────────────────────────────────
+# logging 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
@@ -67,7 +67,7 @@ except Exception as exc:
 # FIX: track confirmed sheet tabs so _ensure_sheet only hits the API once per tab
 _known_tabs: set[str] = set()
 
-# ── caches ─────────────────────────────────────────────────────────────────────
+# caches
 # Message entry: { "ts": str, "user_id": int, "username": str, "text": str }
 # File entry:    { "ts": str, "user_id": int, "username": str,
 #                  "filename": str, "mime_type": str, "data": bytes }
