@@ -39,9 +39,9 @@ TG_API_TOKEN      = os.getenv("TG_API_TOKEN", "")
 GS_SERVICE_JSON   = os.getenv("GS_SERVICE_JSON", "credentials.json")
 GS_SPREADSHEET_ID = os.getenv("GS_SPREADSHEET_ID")
 
-MAX_FILE_SIZE  = 5000000            # 5 MB 
-FLUSH_INTERVAL = 30                 # seconds between cache flushes
-MAX_BACKOFF    = 64                 # seconds, ceiling for exponential backoff
+MAX_FILE_SIZE  = 50000          # 50 KB, corresponds to the character count ceiling in a single cell
+FLUSH_INTERVAL = 30             # seconds between cache flushes
+MAX_BACKOFF    = 64             # seconds, ceiling for exponential backoff
 
 # check for presence of vital variables
 for name, value in [
@@ -201,7 +201,13 @@ async def flush_caches() -> None:
             _message_cache[:0] = messages  # prepend to preserve order
             _file_cache[:0]    = files
         logger.error("Flush failed — entries returned to cache for next attempt.")
+
+        if HttpError.status_code == 400:
+            for file in files:
+                if len(file["data"]) > 50000:
+                    files.remove(file)
         raise
+
 
 
 async def periodic_flush() -> None:
