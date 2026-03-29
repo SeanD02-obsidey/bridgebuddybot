@@ -33,7 +33,7 @@ cd bridgebuddybot
 2) Install and sync dependencies with **uv**
 
 ```
-uv install && uv sync
+uv sync
 ```
 
 3) Run main.py
@@ -64,6 +64,7 @@ Additionally, the following in-code variables are available for fine-grained flu
 ## References
 
 - https://core.telegram.org/bots/api
+- https://docs.python-telegram-bot.org/en/stable/
 - https://developers.google.com/workspace/sheets
 
 ## License
