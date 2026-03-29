@@ -2,6 +2,8 @@ import asyncio
 import logging
 import os
 import io
+import base64
+import time
 from datetime import datetime, timezone
 from dotenv import load_dotenv
 
@@ -18,6 +20,10 @@ from telegram.ext import (
     MessageHandler,
 )
 
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
+
 load_dotenv # read variables from .env and set them in os.environ
 
 # Enable logging
@@ -30,24 +36,190 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # Define configuration constants
-URL = os.getenv("RENDER_EXTERNAL_URL") # web address that the bot is reachable on
-PORT = 8443 # Telegram Bot API supports ports 443, 80, 88, 8443
-TG_API_TOKEN = os.getenv("TG_API_TOKEN", "") # telegram token
-GS_API_TOKEN = os.getenv("GS_API_TOKEN", "") # Google Sheets token
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+URL                 = os.getenv("RENDER_EXTERNAL_URL") # web address that the bot is reachable on
+PORT                = int(os.getenv("PORT", "443")) # Telegram Bot API supports ports 443, 80, 88, 8443
 
+TG_API_TOKEN        = os.getenv("TG_API_TOKEN", "") # telegram token
+MAX_FILE_SIZE       = 10 * 1024 * 512  # ≈ 5 MB; maximum non-text object file size in Telegram
+
+GS_SERVICE_JSON     = os.getenv("GS_SERVICE_JSON", "credentials.json") # minified JSON credentials for the Google Sheets service account; credentials.json as a fallback
+GS_SPREADSHEET_ID   = os.getenv("GS_SPREADSHEET_ID", "") # Google Sheets spreadsheet ID
+FLUSH_INTERVAL      = 30          # seconds between flushes
+MAX_BACKOFF         = 64          # seconds, ceiling for exponential backoff
 
 # Check presence of application critical variables;
 # Raise exception if variable content is empty
-critical_variables = [URL, TG_API_TOKEN, GS_API_TOKEN]
+critical_variables = [URL, TG_API_TOKEN, GS_SERVICE_JSON]
 for variable in critical_variables:
     if variable is None:
         raise ValueError(f"{variable} environment variable is not set properly: check env?")
 
 
-# file cache
-# Each entry: { "filename": str, "mime_type": str, "data": bytes, "ts": str }
-_file_cache: list[dict] = []
+# caches
+# Message entry : { "ts": str, "user_id": int, "username": str, "text": str }
+# File entry    : { "ts": str, "user_id": int, "username": str,
+#                   "filename": str, "mime_type": str, "data": bytes }
+_message_cache: list[dict] = []
+_file_cache:    list[dict] = []
+_cache_lock = asyncio.Lock()
+
+
+# Google Sheets client
+def _build_sheets_service():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds  = service_account.Credentials.from_service_account_file(
+        GS_SERVICE_JSON, scopes=scopes
+    )
+    return build("sheets", "v4", credentials=creds, cache_discovery=False)
+
+
+_sheets = _build_sheets_service()
+
+
+# exponential backoff helper
+async def _with_backoff(coro_fn, *args, **kwargs):
+    """
+    Call an async callable with full exponential backoff.
+    Retries on 429 / 5xx HTTP errors and generic transient exceptions.
+    Raises the final exception if all attempts are exhausted.
+    """
+    attempt = 0
+    while True:
+        try:
+            return await coro_fn(*args, **kwargs)
+        except HttpError as exc:
+            status = exc.resp.status
+            if status in (429, 500, 502, 503, 504):
+                wait = min(2 ** attempt + (time.monotonic() % 1), MAX_BACKOFF)
+                logger.warning(
+                    "Sheets API HTTP %s on attempt %d — retrying in %.1fs",
+                    status, attempt, wait,
+                )
+                await asyncio.sleep(wait)
+                attempt += 1
+            else:
+                raise   # non-retryable (e.g. 403 permission denied)
+        except Exception as exc:
+            if attempt >= 7:    # ~2 min total wait ceiling
+                logger.error("Sheets flush failed after %d attempts: %s", attempt, exc)
+                raise
+            wait = min(2 ** attempt + (time.monotonic() % 1), MAX_BACKOFF)
+            logger.warning(
+                "Transient error on attempt %d (%s) — retrying in %.1fs",
+                attempt, exc, wait,
+            )
+            await asyncio.sleep(wait)
+            attempt += 1
+
+
+# sheet helpers
+async def _ensure_sheet(name: str) -> None:
+    """Create a worksheet tab if it does not already exist."""
+    def _run():
+        meta = _sheets.spreadsheets().get(
+            spreadsheetId=GS_SPREADSHEET_ID
+        ).execute()
+        existing = {s["properties"]["title"] for s in meta["sheets"]}
+        if name not in existing:
+            body = {"requests": [{"addSheet": {"properties": {"title": name}}}]}
+            _sheets.spreadsheets().batchUpdate(
+                spreadsheetId=GS_SPREADSHEET_ID, body=body
+            ).execute()
+            logger.info("Created sheet tab: %s", name)
+
+    await _with_backoff(asyncio.to_thread, _run)
+
+
+async def _append_rows(sheet_name: str, rows: list[list]) -> None:
+    """Append rows to a named sheet tab."""
+    def _run():
+        _sheets.spreadsheets().values().append(
+            spreadsheetId=GS_SPREADSHEET_ID,
+            range=f"{sheet_name}!A1",
+            valueInputOption="RAW",
+            insertDataOption="INSERT_ROWS",
+            body={"values": rows},
+        ).execute()
+
+    await _with_backoff(asyncio.to_thread, _run)
+
+
+# flush logic
+async def _flush_messages(batch: list[dict]) -> None:
+    """Write a batch of text messages to the 'Messages' sheet."""
+    await _ensure_sheet("Messages")
+
+    rows = [
+        [
+            entry["ts"],
+            str(entry["user_id"]),
+            entry["username"],
+            entry["text"],
+        ]
+        for entry in batch
+    ]
+    await _append_rows("Messages", rows)
+    logger.info("Flushed %d message(s) to Sheets.", len(rows))
+
+
+async def _flush_files(batch: list[dict]) -> None:
+    """
+    Write a batch of file entries to the 'Files' sheet.
+    Binary content is stored as a base64 string in column E so the sheet
+    remains valid UTF-8.  For production you may prefer to upload to GCS/Drive
+    and store only the URL here.
+    """
+    await _ensure_sheet("Files")
+
+    rows = [
+        [
+            entry["ts"],
+            str(entry["user_id"]),
+            entry["username"],
+            entry["filename"],
+            entry["mime_type"],
+            base64.b64encode(entry["data"]).decode(),   # column F
+        ]
+        for entry in batch
+    ]
+    await _append_rows("Files", rows)
+    logger.info("Flushed %d file(s) to Sheets.", len(rows))
+
+
+async def flush_caches() -> None:
+    """Drain both caches and write to Google Sheets atomically."""
+    async with _cache_lock:
+        messages = _message_cache.copy()
+        files    = _file_cache.copy()
+        _message_cache.clear()
+        _file_cache.clear()
+
+    if not messages and not files:
+        return
+
+    try:
+        if messages:
+            await _flush_messages(messages)
+        if files:
+            await _flush_files(files)
+    except Exception:
+        # Put entries back so they are not silently dropped
+        async with _cache_lock:
+            _message_cache[:0] = messages
+            _file_cache[:0]    = files
+        logger.error("Flush failed — entries returned to cache for next attempt.")
+        raise
+
+
+async def periodic_flush() -> None:
+    """Background task: flush every FLUSH_INTERVAL seconds."""
+    while True:
+        await asyncio.sleep(FLUSH_INTERVAL)
+        try:
+            await flush_caches()
+        except Exception as exc:
+            logger.error("Periodic flush error (will retry next cycle): %s", exc)
+
 
 
 async def _download_and_cache(
@@ -55,142 +227,126 @@ async def _download_and_cache(
     filename: str,
     mime_type: str,
     file_size: int | None,
+    user_id: int,
+    username: str,
     bot,
 ) -> bool:
-    """
-    Download a Telegram file into memory and append it to _file_cache.
-    Returns False (and notifies nothing) if the file exceeds MAX_FILE_SIZE.
-    """
-    # caller sends the "too large" reply
     if file_size and file_size > MAX_FILE_SIZE:
-        return False 
+        return False
 
     tg_file = await bot.get_file(file_id)
-
     buf = io.BytesIO()
     await tg_file.download_to_memory(buf)
     data = buf.getvalue()
 
-    # double-check after download
-    if len(data) > MAX_FILE_SIZE: 
+    if len(data) > MAX_FILE_SIZE:
         return False
 
-    _file_cache.append({
-        "filename":  filename,
-        "mime_type": mime_type,
-        "data":      data,
-        "ts":        datetime.now(timezone.utc)
-    })
-    logger.info("Cached %s (%d bytes)", filename, len(data))
+    async with _cache_lock:
+        _file_cache.append({
+            "ts":        datetime.now(timezone.utc).isoformat(),
+            "user_id":   user_id,
+            "username":  username,
+            "filename":  filename,
+            "mime_type": mime_type,
+            "data":      data,
+        })
+    logger.info("Cached file %s (%d bytes)", filename, len(data))
     return True
 
+# telegram handlers
+def _sender(msg) -> tuple[int, str]:
+    if not msg.from_user:
+        return (0, "unknown")
+    return (msg.from_user.id, msg.from_user.username or msg.from_user.first_name)
+
+
 async def reply(update: Update, _) -> None:
-    """Handle plain text messages."""
     if not update.message:
         return
-    text = update.message.text or ""
-    logger.info("Text message: %s", text)
-    # TODO: push `text` to Google Sheets via your API
-    await update.message.reply_text(
+    msg = update.message
+    user_id, username = _sender(msg)
+    text = msg.text or ""
+
+    async with _cache_lock:
+        _message_cache.append({
+            "ts":       datetime.now(timezone.utc),
+            "user_id":  user_id,
+            "username": username,
+            "text":     text,
+        })
+
+    await msg.reply_text(
         "Thank you for contacting us! Your message has been successfully recorded."
     )
 
 
+
 async def handle_attachment(update: Update, _) -> None:
-    """Handle documents, photos, video, stickers, etc."""
     if not update.message:
         return
-
     msg = update.message
     bot = msg.get_bot()
+    user_id, username = _sender(msg)
 
-    # ── resolve the attachment ─────────────────────────────────────────────────
     if msg.document:
-        file_id   = msg.document.file_id
-        filename  = msg.document.file_name or f"document_{file_id}"
-        mime_type = msg.document.mime_type or "application/octet-stream"
-        file_size = msg.document.file_size
-
+        file_id, filename = msg.document.file_id, msg.document.file_name or f"doc_{msg.document.file_id}"
+        mime_type, file_size = msg.document.mime_type or "application/octet-stream", msg.document.file_size
     elif msg.photo:
-        # Telegram sends multiple sizes; take the largest
-        photo     = msg.photo[-1]
-        file_id   = photo.file_id
-        filename  = f"photo_{file_id}.jpg"
-        mime_type = "image/jpeg"
-        file_size = photo.file_size
-
+        p = msg.photo[-1]
+        file_id, filename = p.file_id, f"photo_{p.file_id}.jpg"
+        mime_type, file_size = "image/jpeg", p.file_size
     elif msg.video:
-        file_id   = msg.video.file_id
-        filename  = msg.video.file_name or f"video_{file_id}.mp4"
-        mime_type = msg.video.mime_type or "video/mp4"
-        file_size = msg.video.file_size
-
+        file_id, filename = msg.video.file_id, msg.video.file_name or f"video_{msg.video.file_id}.mp4"
+        mime_type, file_size = msg.video.mime_type or "video/mp4", msg.video.file_size
     else:
         await msg.reply_text("Unsupported attachment type.")
         return
 
     if file_size and file_size > MAX_FILE_SIZE:
         await msg.reply_text(
-            f"⚠️ File is too large ({file_size / 1_048_576:.1f} MB). "
-            "Please keep attachments under 10 MB."
+            f"⚠️ File is too large ({file_size / 1_048_576:.1f} MB). Please keep attachments under 10 MB."
         )
         return
 
-    ok = await _download_and_cache(file_id, filename, mime_type, file_size, bot)
+    ok = await _download_and_cache(file_id, filename, mime_type, file_size, user_id, username, bot)
     if not ok:
-        await msg.reply_text(
-            "⚠️ The file exceeds the 10 MB limit and was not recorded."
-        )
+        await msg.reply_text("⚠️ The file exceeds the 10 MB limit and was not recorded.")
         return
 
-    # TODO: flush _file_cache to Google Sheets via your API
-    await msg.reply_text(
-        f"✅ Your attachment ({filename}) has been received and recorded."
-    )
+    await msg.reply_text(f"✅ Your attachment ({filename}) has been received and recorded.")
+
 
 
 async def handle_audio(update: Update, _) -> None:
-    """Handle voice messages and audio files."""
     if not update.message:
         return
-
     msg = update.message
     bot = msg.get_bot()
+    user_id, username = _sender(msg)
 
     if msg.voice:
-        file_id   = msg.voice.file_id
-        filename  = f"voice_{file_id}.ogg"
-        mime_type = msg.voice.mime_type or "audio/ogg"
-        file_size = msg.voice.file_size
-
+        file_id, filename = msg.voice.file_id, f"voice_{msg.voice.file_id}.ogg"
+        mime_type, file_size = msg.voice.mime_type or "audio/ogg", msg.voice.file_size
     elif msg.audio:
-        file_id   = msg.audio.file_id
-        filename  = (msg.audio.file_name or f"audio_{file_id}.mp3")
-        mime_type = msg.audio.mime_type or "audio/mpeg"
-        file_size = msg.audio.file_size
-
+        file_id, filename = msg.audio.file_id, msg.audio.file_name or f"audio_{msg.audio.file_id}.mp3"
+        mime_type, file_size = msg.audio.mime_type or "audio/mpeg", msg.audio.file_size
     else:
         await msg.reply_text("Unsupported audio type.")
         return
 
     if file_size and file_size > MAX_FILE_SIZE:
         await msg.reply_text(
-            f"⚠️ Audio is too large ({file_size / 1_048_576:.1f} MB). "
-            "Please keep audio messages under 10 MB."
+            f"⚠️ Audio is too large ({file_size / 1_048_576:.1f} MB). Please keep audio under 10 MB."
         )
         return
 
-    ok = await _download_and_cache(file_id, filename, mime_type, file_size, bot)
+    ok = await _download_and_cache(file_id, filename, mime_type, file_size, user_id, username, bot)
     if not ok:
-        await msg.reply_text(
-            "⚠️ The audio file exceeds the 10 MB limit and was not recorded."
-        )
+        await msg.reply_text("⚠️ The audio file exceeds the 10 MB limit and was not recorded.")
         return
 
-    # TODO: flush _file_cache to Google Sheets via your API
-    await msg.reply_text(
-        "✅ Your audio message has been received and recorded."
-    )
+    await msg.reply_text("✅ Your audio message has been received and recorded.")
 
 async def main() -> None:
     application = (
@@ -202,10 +358,7 @@ async def main() -> None:
         filters.Document.ALL | filters.PHOTO | filters.VIDEO | filters.Sticker.ALL,
         handle_attachment,
     ))
-    application.add_handler(MessageHandler(
-        filters.VOICE | filters.AUDIO,
-        handle_audio,
-    ))
+    application.add_handler(MessageHandler(filters.VOICE | filters.AUDIO, handle_audio))
 
     await application.bot.set_webhook(
         url=f"{URL}/telegram", allowed_updates=Update.ALL_TYPES
@@ -222,24 +375,23 @@ async def main() -> None:
 
     starlette_app = Starlette(
         routes=[
-            Route("/telegram", telegram, methods=["POST"]),
-            Route("/healthcheck", health, methods=["GET"]),
+            Route("/telegram",    telegram, methods=["POST"]),
+            Route("/healthcheck", health,   methods=["GET"]),
         ]
     )
-
     webserver = uvicorn.Server(
-        config=uvicorn.Config(
-            app=starlette_app,
-            port=PORT,
-            use_colors=False,
-            host="0.0.0.0",
-        )
+        config=uvicorn.Config(app=starlette_app, port=PORT, use_colors=False, host="0.0.0.0")
     )
 
     async with application:
         await application.start()
-        await webserver.serve()
-        await application.stop()
+        flush_task = asyncio.create_task(periodic_flush())
+        try:
+            await webserver.serve()
+        finally:
+            flush_task.cancel()
+            await flush_caches()   # final drain on shutdown
+            await application.stop()
 
 
 if __name__ == "__main__":
