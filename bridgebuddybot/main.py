@@ -14,74 +14,74 @@ from starlette.responses import PlainTextResponse, Response
 from starlette.routing import Route
 
 from telegram import Update
-from telegram.ext import (
-    Application,
-    filters,
-    MessageHandler,
-)
+from telegram.ext import Application, filters, MessageHandler
 
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
 
-load_dotenv # read variables from .env and set them in os.environ
+load_dotenv()  # FIX: was referenced as a value, not called as a function
 
-# Enable logging
+# ── logging ────────────────────────────────────────────────────────────────────
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
 )
-# set higher logging level for httpx to avoid all GET and POST requests being logged
 logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("googleapiclient").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
 
-# Define configuration constants
-URL                 = os.getenv("RENDER_EXTERNAL_URL") # web address that the bot is reachable on
-PORT                = int(os.getenv("PORT", "443")) # Telegram Bot API supports ports 443, 80, 88, 8443
+# environment and app-local variables
+URL               = os.getenv("RENDER_EXTERNAL_URL")
+PORT              = int(os.getenv("PORT", "8443"))
+TG_API_TOKEN      = os.getenv("TG_API_TOKEN", "")
+GS_SERVICE_JSON   = os.getenv("GS_SERVICE_JSON", "credentials.json")
+GS_SPREADSHEET_ID = os.getenv("GS_SPREADSHEET_ID")
 
-TG_API_TOKEN        = os.getenv("TG_API_TOKEN", "") # telegram token
-MAX_FILE_SIZE       = 10 * 1024 * 512  # ≈ 5 MB; maximum non-text object file size in Telegram
+MAX_FILE_SIZE  = 5000000            # 5 MB 
+FLUSH_INTERVAL = 30                 # seconds between cache flushes
+MAX_BACKOFF    = 64                 # seconds, ceiling for exponential backoff
 
-GS_SERVICE_JSON     = os.getenv("GS_SERVICE_JSON", "credentials.json") # minified JSON credentials for the Google Sheets service account; credentials.json as a fallback
-GS_SPREADSHEET_ID   = os.getenv("GS_SPREADSHEET_ID", "") # Google Sheets spreadsheet ID
-FLUSH_INTERVAL      = 30          # seconds between flushes
-MAX_BACKOFF         = 64          # seconds, ceiling for exponential backoff
+# check for presence of vital variables
+for name, value in [
+    ("RENDER_EXTERNAL_URL", URL),
+    ("TG_API_TOKEN",        TG_API_TOKEN),
+    ("GS_SERVICE_JSON",     GS_SERVICE_JSON),
+    ("GS_SPREADSHEET_ID",   GS_SPREADSHEET_ID),
+]:
+    if not value:
+        raise ValueError(f"Environment variable {name!r} is missing or empty.")
 
-# Check presence of application critical variables;
-# Raise exception if variable content is empty
-critical_variables = [URL, TG_API_TOKEN, GS_SERVICE_JSON]
-for variable in critical_variables:
-    if variable is None:
-        raise ValueError(f"{variable} environment variable is not set properly: check env?")
+# Google Sheets client
+# wrapped in try/except so a bad credentials file gives a clear error
+try:
+    _creds = service_account.Credentials.from_service_account_file(
+        GS_SERVICE_JSON,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    _sheets = build("sheets", "v4", credentials=_creds, cache_discovery=False)
+except Exception as exc:
+    raise RuntimeError(f"Failed to initialise Google Sheets client: {exc}") from exc
 
+# FIX: track confirmed sheet tabs so _ensure_sheet only hits the API once per tab
+_known_tabs: set[str] = set()
 
-# caches
-# Message entry : { "ts": str, "user_id": int, "username": str, "text": str }
-# File entry    : { "ts": str, "user_id": int, "username": str,
-#                   "filename": str, "mime_type": str, "data": bytes }
+# ── caches ─────────────────────────────────────────────────────────────────────
+# Message entry: { "ts": str, "user_id": int, "username": str, "text": str }
+# File entry:    { "ts": str, "user_id": int, "username": str,
+#                  "filename": str, "mime_type": str, "data": bytes }
 _message_cache: list[dict] = []
 _file_cache:    list[dict] = []
 _cache_lock = asyncio.Lock()
 
 
-# Google Sheets client
-def _build_sheets_service():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
-    creds  = service_account.Credentials.from_service_account_file(
-        GS_SERVICE_JSON, scopes=scopes
-    )
-    return build("sheets", "v4", credentials=creds, cache_discovery=False)
-
-
-_sheets = _build_sheets_service()
-
-
-# exponential backoff helper
+# exponential backoff 
 async def _with_backoff(coro_fn, *args, **kwargs):
     """
-    Call an async callable with full exponential backoff.
-    Retries on 429 / 5xx HTTP errors and generic transient exceptions.
-    Raises the final exception if all attempts are exhausted.
+    Retry an async callable with exponential backoff + jitter.
+    Retries on 429 / 5xx HttpErrors and generic transient exceptions.
+    Raises after 7 failed attempts (~2 min cumulative wait).
     """
     attempt = 0
     while True:
@@ -98,10 +98,10 @@ async def _with_backoff(coro_fn, *args, **kwargs):
                 await asyncio.sleep(wait)
                 attempt += 1
             else:
-                raise   # non-retryable (e.g. 403 permission denied)
+                raise  # non-retryable (e.g. 403 permission denied)
         except Exception as exc:
-            if attempt >= 7:    # ~2 min total wait ceiling
-                logger.error("Sheets flush failed after %d attempts: %s", attempt, exc)
+            if attempt >= 7:
+                logger.error("Sheets call failed after %d attempts: %s", attempt, exc)
                 raise
             wait = min(2 ** attempt + (time.monotonic() % 1), MAX_BACKOFF)
             logger.warning(
@@ -114,11 +114,12 @@ async def _with_backoff(coro_fn, *args, **kwargs):
 
 # sheet helpers
 async def _ensure_sheet(name: str) -> None:
-    """Create a worksheet tab if it does not already exist."""
+    """Create a worksheet tab if it does not already exist (cached after first check)."""
+    if name in _known_tabs:
+        return
+
     def _run():
-        meta = _sheets.spreadsheets().get(
-            spreadsheetId=GS_SPREADSHEET_ID
-        ).execute()
+        meta = _sheets.spreadsheets().get(spreadsheetId=GS_SPREADSHEET_ID).execute()
         existing = {s["properties"]["title"] for s in meta["sheets"]}
         if name not in existing:
             body = {"requests": [{"addSheet": {"properties": {"title": name}}}]}
@@ -126,6 +127,7 @@ async def _ensure_sheet(name: str) -> None:
                 spreadsheetId=GS_SPREADSHEET_ID, body=body
             ).execute()
             logger.info("Created sheet tab: %s", name)
+        _known_tabs.add(name)
 
     await _with_backoff(asyncio.to_thread, _run)
 
@@ -148,14 +150,8 @@ async def _append_rows(sheet_name: str, rows: list[list]) -> None:
 async def _flush_messages(batch: list[dict]) -> None:
     """Write a batch of text messages to the 'Messages' sheet."""
     await _ensure_sheet("Messages")
-
     rows = [
-        [
-            entry["ts"],
-            str(entry["user_id"]),
-            entry["username"],
-            entry["text"],
-        ]
+        [entry["ts"], str(entry["user_id"]), entry["username"], entry["text"]]
         for entry in batch
     ]
     await _append_rows("Messages", rows)
@@ -165,12 +161,10 @@ async def _flush_messages(batch: list[dict]) -> None:
 async def _flush_files(batch: list[dict]) -> None:
     """
     Write a batch of file entries to the 'Files' sheet.
-    Binary content is stored as a base64 string in column E so the sheet
-    remains valid UTF-8.  For production you may prefer to upload to GCS/Drive
-    and store only the URL here.
+    Binary content is base64-encoded into column F so the sheet stays valid UTF-8.
+    For production, consider uploading to GCS/Drive and storing only the URL.
     """
     await _ensure_sheet("Files")
-
     rows = [
         [
             entry["ts"],
@@ -178,7 +172,7 @@ async def _flush_files(batch: list[dict]) -> None:
             entry["username"],
             entry["filename"],
             entry["mime_type"],
-            base64.b64encode(entry["data"]).decode(),   # column F
+            base64.b64encode(entry["data"]).decode(),
         ]
         for entry in batch
     ]
@@ -187,7 +181,7 @@ async def _flush_files(batch: list[dict]) -> None:
 
 
 async def flush_caches() -> None:
-    """Drain both caches and write to Google Sheets atomically."""
+    """Drain both caches and write to Google Sheets. Returns entries to cache on failure."""
     async with _cache_lock:
         messages = _message_cache.copy()
         files    = _file_cache.copy()
@@ -203,9 +197,8 @@ async def flush_caches() -> None:
         if files:
             await _flush_files(files)
     except Exception:
-        # Put entries back so they are not silently dropped
         async with _cache_lock:
-            _message_cache[:0] = messages
+            _message_cache[:0] = messages  # prepend to preserve order
             _file_cache[:0]    = files
         logger.error("Flush failed — entries returned to cache for next attempt.")
         raise
@@ -221,7 +214,7 @@ async def periodic_flush() -> None:
             logger.error("Periodic flush error (will retry next cycle): %s", exc)
 
 
-
+# file download helper
 async def _download_and_cache(
     file_id: str,
     filename: str,
@@ -231,6 +224,7 @@ async def _download_and_cache(
     username: str,
     bot,
 ) -> bool:
+    """Download a Telegram file into memory and append it to the file cache."""
     if file_size and file_size > MAX_FILE_SIZE:
         return False
 
@@ -239,7 +233,7 @@ async def _download_and_cache(
     await tg_file.download_to_memory(buf)
     data = buf.getvalue()
 
-    if len(data) > MAX_FILE_SIZE:
+    if len(data) > MAX_FILE_SIZE:  # defensive re-check after download
         return False
 
     async with _cache_lock:
@@ -254,6 +248,7 @@ async def _download_and_cache(
     logger.info("Cached file %s (%d bytes)", filename, len(data))
     return True
 
+
 # telegram handlers
 def _sender(msg) -> tuple[int, str]:
     if not msg.from_user:
@@ -266,20 +261,18 @@ async def reply(update: Update, _) -> None:
         return
     msg = update.message
     user_id, username = _sender(msg)
-    text = msg.text or ""
 
     async with _cache_lock:
         _message_cache.append({
-            "ts":       datetime.now(timezone.utc),
+            "ts":       datetime.now(timezone.utc).isoformat(),
             "user_id":  user_id,
             "username": username,
-            "text":     text,
+            "text":     msg.text or "",
         })
 
     await msg.reply_text(
         "Thank you for contacting us! Your message has been successfully recorded."
     )
-
 
 
 async def handle_attachment(update: Update, _) -> None:
@@ -290,22 +283,35 @@ async def handle_attachment(update: Update, _) -> None:
     user_id, username = _sender(msg)
 
     if msg.document:
-        file_id, filename = msg.document.file_id, msg.document.file_name or f"doc_{msg.document.file_id}"
-        mime_type, file_size = msg.document.mime_type or "application/octet-stream", msg.document.file_size
+        file_id   = msg.document.file_id
+        filename  = msg.document.file_name or f"doc_{msg.document.file_id}"
+        mime_type = msg.document.mime_type or "application/octet-stream"
+        file_size = msg.document.file_size
     elif msg.photo:
-        p = msg.photo[-1]
-        file_id, filename = p.file_id, f"photo_{p.file_id}.jpg"
-        mime_type, file_size = "image/jpeg", p.file_size
+        p         = msg.photo[-1]
+        file_id   = p.file_id
+        filename  = f"photo_{p.file_id}.jpg"
+        mime_type = "image/jpeg"
+        file_size = p.file_size
     elif msg.video:
-        file_id, filename = msg.video.file_id, msg.video.file_name or f"video_{msg.video.file_id}.mp4"
-        mime_type, file_size = msg.video.mime_type or "video/mp4", msg.video.file_size
+        file_id   = msg.video.file_id
+        filename  = msg.video.file_name or f"video_{msg.video.file_id}.mp4"
+        mime_type = msg.video.mime_type or "video/mp4"
+        file_size = msg.video.file_size
+    elif msg.sticker:
+        ext       = "tgs" if msg.sticker.is_animated else ("webm" if msg.sticker.is_video else "webp")
+        file_id   = msg.sticker.file_id
+        filename  = f"sticker_{msg.sticker.file_id}.{ext}"
+        mime_type = "image/webp"
+        file_size = msg.sticker.file_size
     else:
         await msg.reply_text("Unsupported attachment type.")
         return
 
     if file_size and file_size > MAX_FILE_SIZE:
         await msg.reply_text(
-            f"⚠️ File is too large ({file_size / 1_048_576:.1f} MB). Please keep attachments under 10 MB."
+            f"⚠️ File is too large ({file_size / 1_048_576:.1f} MB). "
+            "Please keep attachments under 10 MB."
         )
         return
 
@@ -317,7 +323,6 @@ async def handle_attachment(update: Update, _) -> None:
     await msg.reply_text(f"✅ Your attachment ({filename}) has been received and recorded.")
 
 
-
 async def handle_audio(update: Update, _) -> None:
     if not update.message:
         return
@@ -326,18 +331,23 @@ async def handle_audio(update: Update, _) -> None:
     user_id, username = _sender(msg)
 
     if msg.voice:
-        file_id, filename = msg.voice.file_id, f"voice_{msg.voice.file_id}.ogg"
-        mime_type, file_size = msg.voice.mime_type or "audio/ogg", msg.voice.file_size
+        file_id   = msg.voice.file_id
+        filename  = f"voice_{msg.voice.file_id}.ogg"
+        mime_type = msg.voice.mime_type or "audio/ogg"
+        file_size = msg.voice.file_size
     elif msg.audio:
-        file_id, filename = msg.audio.file_id, msg.audio.file_name or f"audio_{msg.audio.file_id}.mp3"
-        mime_type, file_size = msg.audio.mime_type or "audio/mpeg", msg.audio.file_size
+        file_id   = msg.audio.file_id
+        filename  = msg.audio.file_name or f"audio_{msg.audio.file_id}.mp3"
+        mime_type = msg.audio.mime_type or "audio/mpeg"
+        file_size = msg.audio.file_size
     else:
         await msg.reply_text("Unsupported audio type.")
         return
 
     if file_size and file_size > MAX_FILE_SIZE:
         await msg.reply_text(
-            f"⚠️ Audio is too large ({file_size / 1_048_576:.1f} MB). Please keep audio under 10 MB."
+            f"⚠️ Audio is too large ({file_size / 1_048_576:.1f} MB). "
+            "Please keep audio under 10 MB."
         )
         return
 
@@ -348,10 +358,10 @@ async def handle_audio(update: Update, _) -> None:
 
     await msg.reply_text("✅ Your audio message has been received and recorded.")
 
+
+# app setup
 async def main() -> None:
-    application = (
-        Application.builder().token(TG_API_TOKEN).updater(None).build()
-    )
+    application = Application.builder().token(TG_API_TOKEN).updater(None).build()
 
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, reply))
     application.add_handler(MessageHandler(
@@ -380,7 +390,12 @@ async def main() -> None:
         ]
     )
     webserver = uvicorn.Server(
-        config=uvicorn.Config(app=starlette_app, port=PORT, use_colors=False, host="0.0.0.0")
+        config=uvicorn.Config(
+            app=starlette_app,
+            port=PORT,
+            use_colors=False,
+            host="0.0.0.0",
+        )
     )
 
     async with application:
@@ -390,10 +405,9 @@ async def main() -> None:
             await webserver.serve()
         finally:
             flush_task.cancel()
-            await flush_caches()   # final drain on shutdown
+            await flush_caches()  # final drain on shutdown
             await application.stop()
 
 
 if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
     asyncio.run(main())
